@@ -1,0 +1,618 @@
+#![cfg_attr(not(feature = "std"), no_std)]
+
+//! # Pallet Counter
+//!
+//! A pallet for managing token operations, EVM interactions, and IPFS hash verification.
+//!
+//! ## Overview
+//!
+//! This pallet provides functionality for:
+//! - Minting and burning tokens (root-only operations)
+//! - Locking and unlocking balances
+//! - Cross-chain transfers between Substrate and EVM
+//! - Message-based transfers with content filtering
+//! - IPFS hash verification with configurable backend authorization
+//!
+//! ## Security Features
+//!
+//! - Configurable backend authorization for IPFS operations
+//! - Signature verification for EVM-to-Substrate transfers
+//! - Content filtering for transfer messages
+//! - IP address detection in messages
+
+pub use pallet::*;
+
+#[cfg(test)]
+mod tests;
+
+#[frame_support::pallet]
+pub mod pallet {
+    use frame_support::{
+        dispatch::DispatchResult,
+        pallet_prelude::*,
+        traits::{Currency, ReservableCurrency},
+    };
+    use frame_system::pallet_prelude::*;
+    use pallet_evm::Pallet as EvmPallet;
+    use sp_core::{H160, U256, ecdsa};
+    use sp_runtime::traits::SaturatedConversion;
+    use codec::Encode;
+    extern crate alloc;
+    #[allow(unused_imports)]
+    use sp_io::crypto::secp256k1_ecdsa_recover_compressed;
+    use sp_io::hashing::keccak_256;
+    use scale_info::prelude::format;
+    use sp_std::vec::Vec;
+    use sp_std::vec;
+    use hex_literal::hex;
+    use pallet_evm:: PrecompileSet;
+    use sp_io::crypto::secp256k1_ecdsa_recover;
+    use frame_support::traits::ExistenceRequirement;
+    use sp_runtime::AccountId32;
+
+    // use log::info;
+    use sp_runtime::print;
+
+
+    // Define the authorized backend account (common account for safety)
+    // pub const AUTHORIZED_BACKEND_ACCOUNT: AccountId32 = AccountId32::new(hex!(
+    //     "64882b6b92eefc93a7e9c929681a7facc12eb8c5ee505c610aa207a5e7c46206"
+    // ));
+
+    type SubstrateBalanceOf<T> = <<T as Config>::SubstrateCurrency as Currency<<T as frame_system::Config>::AccountId>>::Balance;
+    #[allow(dead_code)]
+    type EvmBalanceOf<T> = <<T as Config>::EvmCurrency as Currency<<T as frame_system::Config>::AccountId>>::Balance;
+
+    #[pallet::pallet]
+    pub struct Pallet<T>(_);
+
+    #[pallet::config]
+    pub trait Config: frame_system::Config + pallet_evm::Config {
+        type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
+        type SubstrateCurrency: Currency<Self::AccountId> + ReservableCurrency<Self::AccountId>;
+        type EvmCurrency: Currency<Self::AccountId>;
+        /// Origin that can manage authorized backend accounts
+        type BackendOrigin: frame_support::traits::EnsureOrigin<Self::RuntimeOrigin>;
+    }
+
+    #[pallet::storage]
+    #[pallet::getter(fn locked_balance)]
+    pub type LockedBalance<T: Config> = StorageMap<_, Blake2_128Concat, T::AccountId, SubstrateBalanceOf<T>, ValueQuery>;
+
+    /// Storage for authorized backend accounts that can sign IPFS operations
+    #[pallet::storage]
+    #[pallet::getter(fn authorized_backends)]
+    pub type AuthorizedBackends<T: Config> = StorageMap<_, Blake2_128Concat, T::AccountId, bool, ValueQuery>;
+
+    #[pallet::event]
+    #[pallet::generate_deposit(pub(super) fn deposit_event)]
+    pub enum Event<T: Config> {
+        Minted { who: T::AccountId, amount: SubstrateBalanceOf<T> },
+        Burned { who: T::AccountId, amount: SubstrateBalanceOf<T> },
+        Locked { who: T::AccountId, amount: SubstrateBalanceOf<T> },
+        Unlocked { who: T::AccountId, amount: SubstrateBalanceOf<T> },
+        EvmBalanceChecked(H160, U256),
+        EvmBalanceMutated(H160, U256, bool),
+        EvmToSubstrateTransfer(H160, T::AccountId, u128),
+        TransferOfBalanceNew{ from: T::AccountId, to: T::AccountId, amount: SubstrateBalanceOf<T>, message: Vec<u8> },
+        IPFSHashIncluded(T::AccountId, Vec<u8>),
+        /// Backend account has been authorized
+        BackendAuthorized(T::AccountId),
+        /// Backend account has been deauthorized
+        BackendDeauthorized(T::AccountId),
+
+    }
+
+    #[pallet::error]
+    pub enum Error<T> {
+        InsufficientBalance,
+        LockNotFound,
+        UnlockNotPossible,
+        Unauthorized,
+        AmountConversionFailed,
+        OperationNotAllowed,
+        InvalidSignature,
+        MessageTooLong,
+        InvalidMessageContent,         
+        SuspiciousContent,
+        InvalidIPFSHash,
+        UnauthorizedBackend,
+        UnauthorizedUser,
+        /// Backend account is not authorized
+        BackendNotAuthorized,
+    }
+
+    #[pallet::call]
+    impl<T: Config> Pallet<T> {
+        
+        #[pallet::weight(10_000)]
+        #[pallet::call_index(0)]
+        pub fn mint(origin: OriginFor<T>, account: T::AccountId, amount: SubstrateBalanceOf<T>) -> DispatchResult {
+            ensure_root(origin)?;
+
+            T::SubstrateCurrency::deposit_creating(&account, amount);
+            Self::deposit_event(Event::Minted { who: account, amount });
+            Ok(())
+        }
+
+        #[pallet::weight(10_000)]
+        #[pallet::call_index(1)]
+        pub fn burn(origin: OriginFor<T>, account: T::AccountId, amount: SubstrateBalanceOf<T>) -> DispatchResult {
+            ensure_root(origin)?;
+
+            T::SubstrateCurrency::withdraw(
+                &account,
+                amount,
+                frame_support::traits::WithdrawReasons::TRANSFER,
+                frame_support::traits::ExistenceRequirement::KeepAlive,
+            )?;
+            Self::deposit_event(Event::Burned { who: account, amount });
+            Ok(())
+        }
+
+        #[pallet::weight(10_000)]
+        #[pallet::call_index(2)]
+        pub fn lock(origin: OriginFor<T>, amount: SubstrateBalanceOf<T>) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+
+            T::SubstrateCurrency::reserve(&who, amount)?;
+            <LockedBalance<T>>::insert(&who, amount);
+            Self::deposit_event(Event::Locked { who: who.clone(), amount });
+            Ok(())
+        }
+        
+
+        #[pallet::weight(10_000)]
+        #[pallet::call_index(3)]
+        pub fn unlock(origin: OriginFor<T>, amount: SubstrateBalanceOf<T>) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+
+            let locked_amount = <LockedBalance<T>>::get(&who);
+            ensure!(locked_amount >= amount, Error::<T>::UnlockNotPossible);
+
+            T::SubstrateCurrency::unreserve(&who, amount);
+            <LockedBalance<T>>::mutate(&who, |balance| *balance -= amount);
+            Self::deposit_event(Event::Unlocked { who: who.clone(), amount });
+            Ok(())
+        }
+
+        #[pallet::weight(10_000)]
+        #[pallet::call_index(4)]
+        pub fn check_evm_balance(origin: OriginFor<T>, evm_address: H160) -> DispatchResult {
+            let _who = ensure_signed(origin)?;
+
+            let (account, _) = EvmPallet::<T>::account_basic(&evm_address);
+
+            Self::deposit_event(Event::EvmBalanceChecked(evm_address, account.balance));
+
+            Ok(())
+        }
+
+        #[pallet::weight(10_000)]
+        #[pallet::call_index(5)]
+        pub fn substrate_to_evm(
+            origin: OriginFor<T>,
+            evm_address: H160,
+            amount: SubstrateBalanceOf<T>,
+            add: bool,
+        ) -> DispatchResult {
+            ensure!(add, Error::<T>::OperationNotAllowed);
+
+            let substrate_account = ensure_signed(origin)?;
+
+            let transferable_balance = T::SubstrateCurrency::free_balance(&substrate_account);
+            ensure!(transferable_balance >= amount, Error::<T>::InsufficientBalance);
+
+            T::SubstrateCurrency::withdraw(
+                &substrate_account,
+                amount,
+                frame_support::traits::WithdrawReasons::TRANSFER,
+                frame_support::traits::ExistenceRequirement::KeepAlive,
+            )?;
+
+            let amount_u256 = U256::from(amount.saturated_into::<u128>());
+
+            EvmPallet::<T>::mutate_balance(evm_address, amount_u256, add);
+
+            Self::deposit_event(Event::EvmBalanceMutated(evm_address, amount_u256, add));
+
+            Ok(())
+        }
+
+        #[pallet::weight(10_000)]
+        #[pallet::call_index(6)]
+        pub fn evm_to_substrate(
+            origin: OriginFor<T>,
+            evm_address: H160,
+            amount: U256,
+            subtract: bool,
+            signature: ecdsa::Signature, 
+        ) -> DispatchResult {
+            ensure!(!subtract, Error::<T>::Unauthorized);
+            // let _who = ensure_signed(origin)?;
+            let substrate_account = ensure_signed(origin)?;
+            sp_runtime::print(format!("amount: {}", amount).as_str());
+            sp_runtime::print(format!("signature:{:?}", signature).as_str());
+        
+            let amount_u128: u128 = amount.try_into().map_err(|_| Error::<T>::AmountConversionFailed)?;
+            let message = format!("Transfer {} SMPL from 0x{:x} to Substrate", amount_u128, evm_address);
+            sp_runtime::print(format!("amount in u128:{}", amount_u128).as_str());
+            sp_runtime::print(format!("message:{}", message).as_str());
+            sp_runtime::print(&format!("message length:{}", message.len()).as_str());
+        
+            let prefix = "\x19Ethereum Signed Message:\n";
+            let message_len = format!("{}", message.len());
+            let message_to_sign = format!("{}{}{}", prefix, message_len, message);
+        
+            let message_hash = keccak_256(message_to_sign.as_bytes());
+            sp_runtime::print(format!("message_to_sign:{}", message_to_sign).as_str());
+            sp_runtime::print(format!("message_hash:{:?}", message_hash).as_str());
+        
+            let r = &signature.0[..32];
+            let s = &signature.0[32..64];
+            let v = &signature.0[64..65];
+            
+            let mut sig_array = [0u8; 65];
+            sig_array[..32].copy_from_slice(r);
+            sig_array[32..64].copy_from_slice(s);
+            sig_array[64..65].copy_from_slice(v);
+        
+            let recovered_pubkey = secp256k1_ecdsa_recover(&sig_array, &message_hash)
+                .map_err(|_| Error::<T>::InvalidSignature)?;
+        
+                sp_runtime::print(format!("recovered_pubkey: {:?}", recovered_pubkey).as_str());
+        
+            let recovered_key_hash = keccak_256(&recovered_pubkey);
+            let recovered_address = H160::from_slice(&recovered_key_hash[12..]);
+        
+            sp_runtime::print(format!("Recovered Ethereum Address: {:?}", recovered_address).as_str());
+        
+            ensure!(recovered_address == evm_address, Error::<T>::Unauthorized);
+        
+            let (account, _) = EvmPallet::<T>::account_basic(&evm_address);
+            ensure!(account.balance >= amount, Error::<T>::InsufficientBalance);
+        
+            EvmPallet::<T>::mutate_balance(evm_address, amount, false);
+        
+            let substrate_amount = SubstrateBalanceOf::<T>::saturated_from(amount_u128);
+        
+            T::SubstrateCurrency::deposit_creating(&substrate_account, substrate_amount);
+        
+            Self::deposit_event(Event::Minted {
+                who: substrate_account.clone(),
+                amount: substrate_amount,
+            });
+            Self::deposit_event(Event::EvmToSubstrateTransfer(evm_address, substrate_account, amount_u128));
+        
+            Ok(())
+        }
+
+
+        #[pallet::weight(5_000)]
+        #[pallet::call_index(7)]
+        pub fn balance_transfer_new(
+            origin: OriginFor<T>,
+            to: T::AccountId,
+            amount: SubstrateBalanceOf<T>,  
+            message: Vec<u8>,               
+        ) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            ensure!(core::str::from_utf8(&message).is_ok(), Error::<T>::InvalidMessageContent);
+            ensure!(message.len() <= 64, Error::<T>::MessageTooLong);
+            let message_str = core::str::from_utf8(&message).unwrap_or("");
+
+            ensure!(
+                message.iter().all(|&byte| (byte >= 32 && byte <= 126)), 
+                Error::<T>::InvalidMessageContent
+            );
+            let url_patterns = ["http://", "https://", "www.", ".com", ".net", ".org", ".xyz", ".io", ".gov", ".edu", ".mil", ".info"];
+            ensure!(
+                !url_patterns.iter().any(|&pattern| message_str.contains(pattern)),
+                Error::<T>::SuspiciousContent
+            );
+            // Enhanced content filtering with better bypass detection
+            ensure!(
+                !Self::contains_suspicious_content(message_str),
+                Error::<T>::SuspiciousContent
+            );
+            ensure!(
+                !Self::contains_ip_address(message_str),
+                Error::<T>::SuspiciousContent
+            );
+
+            T::SubstrateCurrency::transfer(&who, &to, amount, ExistenceRequirement::KeepAlive)?;
+
+            Self::deposit_event(Event::TransferOfBalanceNew {
+                from: who.clone(),
+                to: to.clone(),
+                amount,
+                message: message.clone(),
+            });
+
+            Ok(())
+        }
+
+        #[pallet::weight(10_000)]
+        #[pallet::call_index(8)]
+        pub fn include_ipfs_hash(
+            origin: OriginFor<T>,
+            backend_account: T::AccountId,
+            ipfs_hash: Vec<u8>,
+            backend_signature: Vec<u8>,  
+        ) -> DispatchResult {
+            let user = ensure_signed(origin)?;
+
+            // Check if the backend account is authorized
+            ensure!(
+                AuthorizedBackends::<T>::get(&backend_account),
+                Error::<T>::BackendNotAuthorized
+            );
+
+            // Convert account to bytes for public key
+            let backend_encoded = backend_account.encode();
+            ensure!(backend_encoded.len() == 32, Error::<T>::InvalidSignature);
+            let mut backend_bytes = [0u8; 32];
+            backend_bytes.copy_from_slice(&backend_encoded[..32]);
+
+            let backend_public_key = sp_core::sr25519::Public::from_raw(backend_bytes);
+
+            let backend_sig = sp_core::sr25519::Signature::try_from(backend_signature.as_slice())
+                .map_err(|_| Error::<T>::InvalidSignature)?;
+
+            let message = ipfs_hash.clone();  
+
+            ensure!(
+                sp_io::crypto::sr25519_verify(
+                    &backend_sig, 
+                    &message, 
+                    &backend_public_key
+                ),
+                Error::<T>::InvalidSignature
+            );
+
+            ensure!(ipfs_hash.len() == 46, Error::<T>::InvalidIPFSHash);
+
+            Self::deposit_event(Event::IPFSHashIncluded(user.clone(), ipfs_hash.clone()));
+
+            Ok(())
+        }
+
+        /// Authorize a backend account to sign IPFS operations
+        #[pallet::weight(10_000)]
+        #[pallet::call_index(9)]
+        pub fn authorize_backend(
+            origin: OriginFor<T>,
+            backend_account: T::AccountId,
+        ) -> DispatchResult {
+            T::BackendOrigin::ensure_origin(origin)?;
+
+            AuthorizedBackends::<T>::insert(&backend_account, true);
+            Self::deposit_event(Event::BackendAuthorized(backend_account));
+
+            Ok(())
+        }
+
+        /// Deauthorize a backend account from signing IPFS operations
+        #[pallet::weight(10_000)]
+        #[pallet::call_index(10)]
+        pub fn deauthorize_backend(
+            origin: OriginFor<T>,
+            backend_account: T::AccountId,
+        ) -> DispatchResult {
+            T::BackendOrigin::ensure_origin(origin)?;
+
+            AuthorizedBackends::<T>::remove(&backend_account);
+            Self::deposit_event(Event::BackendDeauthorized(backend_account));
+
+            Ok(())
+        }
+
+  
+    }
+
+    // Utility functions for content validation (not generic)
+    impl<T: Config> Pallet<T> {
+        pub fn contains_ip_address(message: &str) -> bool {
+            if Self::contains_ipv4_address(message) {
+                return true;
+            }    
+            if Self::contains_ipv6_address(message) {
+                return true;
+            }
+            false
+        }
+    
+        /// Enhanced suspicious content detection with bypass prevention
+        pub fn contains_suspicious_content(message: &str) -> bool {
+            let normalized = Self::normalize_text(message);
+            
+            // Enhanced blacklist with common variations and leetspeak
+            let suspicious_patterns = [
+                "scam", "sc4m", "5cam", "s(am", "sc@m",
+                "fraud", "fr4ud", "frawd", "fr@ud",
+                "hack", "h4ck", "h@ck", "hak",
+                "illegal", "1llegal", "!llegal", "il1egal",
+                "phishing", "ph1shing", "phish1ng", "fish1ng",
+                "steal", "st3al", "5teal",
+                "malware", "m4lware", "malw4re",
+                "virus", "v1rus", "v!rus",
+                "trojan", "tr0jan", "tr0j4n",
+                "ransomware", "r4nsomware", "ransom",
+                "keylogger", "k3ylogger", "keylog",
+                "spyware", "spy", "5py",
+                "exploit", "3xploit", "expl0it",
+                "backdoor", "b4ckdoor", "back_door",
+                "botnet", "b0tnet", "bot_net",
+                "ponzi", "p0nzi", "pyramid",
+                "rugpull", "rug_pull", "rug-pull",
+                "airdrop", "air_drop", "4irdrop",
+                "giveaway", "give_away", "g1veaway",
+                "doubler", "d0ubler", "double_your",
+                "investment", "1nvestment", "invest_now",
+                "guaranteed", "gu4ranteed", "guarantee",
+                "profit", "pr0fit", "profits",
+                "earning", "e4rning", "earn_money",
+                "winner", "w1nner", "you_won",
+                "congratulations", "congrats", "congratz",
+                "urgent", "urg3nt", "immediate",
+                "limited_time", "limited", "expires",
+                "crypto_giveaway", "free_crypto", "free_tokens",
+                "wallet_validation", "verify_wallet", "validate",
+                "seed_phrase", "private_key", "mnemonic",
+                "recovery_phrase", "backup_phrase",
+                "metamask", "trustwallet", "coinbase",
+                "binance", "kraken", "exchange",
+                "defi", "nft_mint", "whitelist",
+                "presale", "ico", "ido", "token_sale",
+            ];
+
+            for pattern in &suspicious_patterns {
+                if normalized.contains(pattern) {
+                    return true;
+                }
+            }
+
+            // Check for excessive punctuation or symbols (spam indicator)
+            let symbol_count = normalized.chars().filter(|c| !c.is_alphanumeric() && !c.is_whitespace()).count();
+            if symbol_count > normalized.len() / 3 {
+                return true;
+            }
+
+            // Check for repeated characters (spam indicator)
+            let mut prev_char = ' ';
+            let mut repeat_count = 0;
+            for ch in normalized.chars() {
+                if ch == prev_char {
+                    repeat_count += 1;
+                    if repeat_count > 4 {
+                        return true;
+                    }
+                } else {
+                    repeat_count = 0;
+                }
+                prev_char = ch;
+            }
+
+            false
+        }
+
+        /// Normalize text to prevent bypass attempts
+        fn normalize_text(text: &str) -> alloc::string::String {
+            text.to_lowercase()
+                .chars()
+                .filter_map(|c| match c {
+                    // Normalize common leetspeak and look-alike characters
+                    '@' => Some('a'),
+                    '4' => Some('a'),
+                    '3' => Some('e'),
+                    '1' | '!' | 'i' => Some('i'),
+                    '0' => Some('o'),
+                    '5' | '$' => Some('s'),
+                    '7' => Some('t'),
+                    '8' => Some('b'),
+                    '9' => Some('g'),
+                    // Remove separators
+                    '_' | '-' | '.' | ' ' => None,
+                    // Handle parentheses and brackets
+                    '(' | ')' | '[' | ']' | '{' | '}' => None,
+                    // Keep normal characters
+                    _ => Some(c),
+                })
+                .collect()
+        }
+
+        pub fn contains_ipv4_address(message: &str) -> bool {
+            // Enhanced IPv4 detection with better validation
+            let parts: Vec<&str> = message.split('.').collect();
+            if parts.len() != 4 {
+                return false;
+            }
+            
+            for part in parts {
+                // Check for empty parts
+                if part.is_empty() {
+                    return false;
+                }
+                
+                // Check for leading zeros (except single '0')
+                if part.len() > 1 && part.starts_with('0') {
+                    return false;
+                }
+                
+                // Parse and validate range
+                match part.parse::<u16>() {
+                    Ok(num) if num <= 255 => continue,
+                    _ => return false,
+                }
+            }
+            true
+        }
+    
+        pub fn contains_ipv6_address(message: &str) -> bool {
+            // Enhanced IPv6 validation with proper RFC compliance
+            let original = message;
+            
+            // Handle compressed zeros (::)
+            let double_colon_count = original.matches("::").count();
+            if double_colon_count > 1 {
+                return false; // Only one :: allowed
+            }
+            
+            // Split on :: if present
+            let (left, right) = if double_colon_count == 1 {
+                let mut parts = original.splitn(2, "::");
+                (parts.next().unwrap_or(""), parts.next().unwrap_or(""))
+            } else {
+                (original, "")
+            };
+            
+            // Count total groups
+            let left_groups: Vec<&str> = if left.is_empty() { vec![] } else { left.split(':').collect() };
+            let right_groups: Vec<&str> = if right.is_empty() { vec![] } else { right.split(':').collect() };
+            
+            let total_groups = left_groups.len() + right_groups.len();
+            
+            // IPv6 has exactly 8 groups, unless :: is used
+            if double_colon_count == 0 && total_groups != 8_usize {
+                return false;
+            }
+            if double_colon_count == 1 && total_groups >= 8_usize {
+                return false;
+            }
+            
+            // Validate each group
+            for groups in [&left_groups, &right_groups] {
+                for group in groups {
+                    if group.is_empty() && double_colon_count == 0 {
+                        return false; // Empty groups only allowed with ::
+                    }
+                    if !group.is_empty() {
+                        if group.len() > 4_usize {
+                            return false; // Max 4 hex digits per group
+                        }
+                        if !group.chars().all(|c| c.is_ascii_hexdigit()) {
+                            return false; // Must be hex digits
+                        }
+                    }
+                }
+            }
+            
+            // Additional checks for edge cases
+            if original.starts_with(":::") || original.ends_with(":::") {
+                return false; // Triple colon not allowed
+            }
+            
+            if original.starts_with(":") && !original.starts_with("::") {
+                return false; // Single leading colon not allowed
+            }
+            
+            if original.ends_with(":") && !original.ends_with("::") {
+                return false; // Single trailing colon not allowed
+            }
+            
+            true
+        }
+    }
+    
+    
+}
