@@ -1,6 +1,6 @@
 # Samplechain
 
-Samplechain is a Substrate-based, Ethereum-compatible Layer 1 blockchain built by [Devolved AI](https://devolvedai.com). It combines the Polkadot SDK with the Frontier EVM stack to deliver a chain that natively supports both Substrate pallets and Solidity smart contracts, with a focus on AI and machine learning applications.
+Samplechain is a Substrate-based, Ethereum-compatible Layer 1 blockchain. It combines the Polkadot SDK with the Frontier EVM stack to deliver a chain that natively supports both Substrate pallets and Solidity smart contracts.
 
 ## Key Features
 
@@ -18,7 +18,7 @@ Samplechain is a Substrate-based, Ethereum-compatible Layer 1 blockchain built b
 
 | Property | Value |
 |----------|-------|
-| Name | SampleChain |
+| Name | SampleCoin |
 | Symbol | SMPL |
 | Decimals | 18 |
 | SS58 Format | 33 |
@@ -214,9 +214,3 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines. All contributions are lic
 - **Runtime**: Apache-2.0
 - **Node CLI**: GPL-3.0-or-later WITH Classpath-exception-2.0
 - **Substrate/Polkadot SDK**: GPL-3.0-only
-
-## Links
-
-- [Samplechain Validator Guide](https://devolved-ai.gitbook.io/samplechain-validator-guide)
-- [Block Explorer (Argoscan)](https://explorer.argoscan.net)
-- [Devolved AI](https://devolvedai.com)
